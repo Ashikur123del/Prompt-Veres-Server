@@ -1,39 +1,29 @@
 const express = require('express');
 const { MongoClient, ServerApiVersion } = require('mongodb');
 require('dotenv').config();
+
 const app = express();
-const cors = require('cors');
 const port = process.env.PORT || 5000;
 
-app.use(cors());
+app.use(require('cors')());
 app.use(express.json());
 
-const uri = process.env.MONGO_DB_URI;
-const client = new MongoClient(uri, {
+const client = new MongoClient(process.env.MONGO_DB_URI, {
   serverApi: { version: ServerApiVersion.v1, strict: true, deprecationErrors: true }
 });
 
-// কালেকশনটি বাইরে রাখুন যাতে সব রুটে ব্যবহার করা যায়
+// Use a variable to store the collection reference
 let promptsCollection;
 
-async function run() {
-  try {
-    await client.connect();
-    // ডাটাবেস এবং কালেকশন সেটআপ
-    promptsCollection = client.db("Prompt_Verse").collection("prompts");
-    console.log("Successfully connected to MongoDB!");
-  } catch (error) {
-    console.error(error);
-  }
+async function connectDB() {
+  await client.connect();
+  promptsCollection = client.db("Prompt_Verse").collection("prompts");
+  console.log("Connected to MongoDB!");
 }
-run();
 
-// রুটগুলো এখন গ্লোবালি এক্সেস করতে পারবে
+// Routes
 app.get('/api/prompts/featured', async (req, res) => {
   try {
-    // চেক করুন ডাটাবেস কানেক্ট হয়েছে কি না
-    if (!promptsCollection) return res.status(503).send({ message: "Database not connected" });
-    
     const result = await promptsCollection
       .find({ status: "approved", visibility: "public" })
       .sort({ rating: -1, copyCount: -1 })
@@ -41,16 +31,11 @@ app.get('/api/prompts/featured', async (req, res) => {
       .toArray();
     res.send(result);
   } catch (error) {
-    res.status(500).send({ message: "Failed to load featured prompts" });
+    res.status(500).send({ message: "Error fetching featured prompts" });
   }
 });
 
-app.get('/', (req, res) => {
-  res.send('Server is running!');
-});
-
-app.listen(port, () => {
-  console.log(`Server is running on port ${port}`);
-});
-
-module.exports = app; // Vercel-এর জন্য এটি যোগ করা ভালো
+// Initialize server
+connectDB().then(() => {
+  app.listen(port, () => console.log(`Server running on port ${port}`));
+}).catch(console.dir);
