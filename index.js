@@ -1,62 +1,56 @@
 const express = require('express');
 const { MongoClient, ServerApiVersion } = require('mongodb');
-require('dotenv').config()
-const app = express()
+require('dotenv').config();
+const app = express();
 const cors = require('cors');
 const port = process.env.PORT || 5000;
 
 app.use(cors());
-app.use(express.json())
-
-
+app.use(express.json());
 
 const uri = process.env.MONGO_DB_URI;
-
 const client = new MongoClient(uri, {
-  serverApi: {
-    version: ServerApiVersion.v1,
-    strict: true,
-    deprecationErrors: true,
-  }
+  serverApi: { version: ServerApiVersion.v1, strict: true, deprecationErrors: true }
 });
+
+// কালেকশনটি বাইরে রাখুন যাতে সব রুটে ব্যবহার করা যায়
+let promptsCollection;
 
 async function run() {
   try {
-
     await client.connect();
-
-    const promptsCollection = client.db("Prompt_Verse").collection("prompts");
-
-    // ---- GET /prompts/featured ----
-    // Home page-এর জন্য ৬টা featured/trending prompt — approved + public হতে হবে
-    app.get('/api/prompts/featured', async (req, res) => {
-      try {
-        const result = await promptsCollection
-          .find({ status: "approved", visibility: "public" })
-          .sort({ rating: -1, copyCount: -1 }) // সবচেয়ে জনপ্রিয়গুলো আগে
-          .limit(6)
-          .toArray();
-
-        res.send(result);
-      } catch (error) {
-        console.error(error);
-        res.status(500).send({ message: "Failed to load featured prompts" });
-      }
-    });
-
-    await client.db("admin").command({ ping: 1 });
-    console.log("Pinged your deployment. You successfully connected to MongoDB!");
-  } finally {
-    // Ensures that the client will close when you finish/error
-    // await client.close();
+    // ডাটাবেস এবং কালেকশন সেটআপ
+    promptsCollection = client.db("Prompt_Verse").collection("prompts");
+    console.log("Successfully connected to MongoDB!");
+  } catch (error) {
+    console.error(error);
   }
 }
-run().catch(console.dir);
+run();
+
+// রুটগুলো এখন গ্লোবালি এক্সেস করতে পারবে
+app.get('/api/prompts/featured', async (req, res) => {
+  try {
+    // চেক করুন ডাটাবেস কানেক্ট হয়েছে কি না
+    if (!promptsCollection) return res.status(503).send({ message: "Database not connected" });
+    
+    const result = await promptsCollection
+      .find({ status: "approved", visibility: "public" })
+      .sort({ rating: -1, copyCount: -1 })
+      .limit(6)
+      .toArray();
+    res.send(result);
+  } catch (error) {
+    res.status(500).send({ message: "Failed to load featured prompts" });
+  }
+});
 
 app.get('/', (req, res) => {
-  res.send('Hello World!')
-})
+  res.send('Server is running!');
+});
 
 app.listen(port, () => {
-  console.log(`Example app listening on port ${port}`)
-})
+  console.log(`Server is running on port ${port}`);
+});
+
+module.exports = app; // Vercel-এর জন্য এটি যোগ করা ভালো
