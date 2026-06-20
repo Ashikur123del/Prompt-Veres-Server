@@ -3,7 +3,7 @@ const { MongoClient, ServerApiVersion } = require('mongodb');
 require('dotenv').config();
 
 const app = express();
-const port = process.env.PORT || 5000;
+const port = process.env.PORT;
 
 app.use(require('cors')());
 app.use(express.json());
@@ -35,7 +35,15 @@ app.get('/api/prompts/featured', async (req, res) => {
   }
 });
 
+app.get('/', (req, res) => {
+
+  res.send('Hello World!')
+
+})
+
 // Initialize server
 connectDB().then(() => {
   app.listen(port, () => console.log(`Server running on port ${port}`));
 }).catch(console.dir);
+
+
