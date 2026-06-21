@@ -1,11 +1,16 @@
 const express = require('express');
-const { MongoClient, ServerApiVersion } = require('mongodb');
+const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
+const jwt = require('jsonwebtoken');
+const cors = require('cors');
 require('dotenv').config();
 
 const app = express();
-const port = process.env.PORT;
+const port = process.env.PORT || 7000;
 
-app.use(require('cors')());
+app.use(cors({
+  origin: process.env.CLIENT_URL || "http://localhost:3000",
+  credentials: true, // session cookie পাঠানোর জন্য জরুরি — wildcard "*" দিয়ে এটা কাজ করবে না
+}));
 app.use(express.json());
 
 const client = new MongoClient(process.env.MONGO_DB_URI, {
@@ -14,14 +19,37 @@ const client = new MongoClient(process.env.MONGO_DB_URI, {
 
 // Use a variable to store the collection reference
 let promptsCollection;
+let usersCollection;
+
+// ---- JWT verify middleware ----
+// Authorization header-এ "Bearer <token>" না থাকলে বা টোকেন invalid হলে রিকোয়েস্ট ব্লক করবে
+const verifyToken = (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return res.status(401).send({ message: "Unauthorized access" });
+  }
+
+  const token = authHeader.split(" ")[1];
+  jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
+    if (err) {
+      return res.status(403).send({ message: "Forbidden access" });
+    }
+    req.decoded = decoded; // { email } — সাইন করার সময় যা পাঠানো হয়েছিল
+    next();
+  });
+};
 
 async function connectDB() {
   await client.connect();
   promptsCollection = client.db("Prompt_Verse").collection("prompts");
+  usersCollection = client.db("Prompt_Verse").collection("user"); // better-auth ডিফল্ট কালেকশন নাম
   console.log("Connected to MongoDB!");
 }
 
-// Routes
+// ===================== Routes =====================
+
+// ---- GET /api/prompts/featured ----
+// Home page-এর জন্য ৬টা featured/trending prompt — approved + public হতে হবে
 app.get('/api/prompts/featured', async (req, res) => {
   try {
     const result = await promptsCollection
@@ -31,19 +59,218 @@ app.get('/api/prompts/featured', async (req, res) => {
       .toArray();
     res.send(result);
   } catch (error) {
+    console.error(error);
     res.status(500).send({ message: "Error fetching featured prompts" });
   }
 });
 
+// ---- GET /api/creators/top ----
+// MongoDB aggregation: prompts collection-এ creatorId দিয়ে গ্রুপ করে total prompts +
+// total copies বের করা হয়, তারপর $lookup দিয়ে users collection থেকে নাম/ছবি/role আনা হয়।
+// ⚠️ ধরে নিচ্ছি prompts ডকুমেন্টে creatorId একটা ObjectId যা user._id-কে রেফার করে।
+app.get('/api/creators/top', async (req, res) => {
+  try {
+    const result = await promptsCollection
+      .aggregate([
+        { $match: { status: "approved", visibility: "public" } },
+        {
+          $group: {
+            _id: "$creatorId",
+            totalPrompts: { $sum: 1 },
+            totalCopies: { $sum: "$copyCount" },
+          },
+        },
+        { $sort: { totalCopies: -1 } },
+        { $limit: 3 },
+        {
+          $lookup: {
+            from: "user",
+            localField: "_id",
+            foreignField: "_id",
+            as: "creator",
+          },
+        },
+        { $unwind: "$creator" },
+        {
+          $project: {
+            _id: 1,
+            totalPrompts: 1,
+            totalCopies: 1,
+            name: "$creator.name",
+            image: "$creator.image",
+            role: "$creator.role",
+          },
+        },
+      ])
+      .toArray();
+
+    res.send(result);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Failed to load top creators" });
+  }
+});
+
+// ---- POST /jwt ----
+// Login/Register-এর পর ক্লায়েন্ট থেকে কল হবে — এই token Express-এর protected রুটে লাগবে
+app.post('/jwt', (req, res) => {
+  const { email } = req.body;
+  if (!email) {
+    return res.status(400).send({ message: "Email is required" });
+  }
+  const token = jwt.sign({ email }, process.env.JWT_SECRET, { expiresIn: "7d" });
+  res.send({ token });
+});
+
+// ---- POST /api/prompts ----
+// নতুন prompt তৈরি — JWT দিয়ে প্রোটেক্টেড, status:"pending" + copyCount:0 ফোর্স করা হয়
+app.post('/api/prompts', verifyToken, async (req, res) => {
+  try {
+    const promptData = req.body;
+    const tokenEmail = req.decoded.email;
+
+    if (promptData.creatorEmail !== tokenEmail) {
+      return res.status(403).send({ message: "Forbidden access" });
+    }
+
+    // ---- Free user হলে সর্বোচ্চ ৩টা prompt-এর সীমা চেক ----
+    const creator = await usersCollection.findOne({ email: tokenEmail });
+    const isPremium = creator?.isPremium === true;
+
+    if (!isPremium) {
+      const existingCount = await promptsCollection.countDocuments({
+        creatorEmail: tokenEmail,
+      });
+      if (existingCount >= 3) {
+        return res.status(403).send({
+          message: "Free users can add a maximum of 3 prompts. Upgrade to Premium for unlimited prompts.",
+        });
+      }
+    }
+
+    const newPrompt = {
+      ...promptData,
+      copyCount: 0,
+      status: "pending",
+      rating: 0,
+      createdAt: new Date(),
+    };
+
+    const result = await promptsCollection.insertOne(newPrompt);
+    res.status(201).send(result);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Failed to create prompt" });
+  }
+});
+
+// ---- GET /api/prompts ----
+// All Prompts পেজের জন্য — server-side search + filter + sort + pagination, সব এক রুটে
+app.get('/api/prompts', async (req, res) => {
+  try {
+    const {
+      search = "",
+      category = "All",
+      aiTool = "All",
+      difficulty = "All",
+      sort = "latest", // latest | popular | copied
+      page = 1,
+      limit = 6,
+    } = req.query;
+
+    const query = { status: "approved", visibility: { $ne: "private-hidden" } };
+
+    // ---- Search: title, tags, aiTool — তিনটাতেই খুঁজবে ----
+    if (search.trim()) {
+      const regex = new RegExp(search.trim(), "i");
+      query.$or = [{ title: regex }, { tags: regex }, { aiTool: regex }];
+    }
+
+    if (category !== "All") query.category = category;
+    if (aiTool !== "All") query.aiTool = aiTool;
+    if (difficulty !== "All") query.difficulty = difficulty;
+
+    // ---- Sort mapping ----
+    const sortMap = {
+      latest: { createdAt: -1 },
+      popular: { rating: -1 },
+      copied: { copyCount: -1 },
+    };
+    const sortQuery = sortMap[sort] || sortMap.latest;
+
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+    const skip = (pageNum - 1) * limitNum;
+
+    const totalCount = await promptsCollection.countDocuments(query);
+    const prompts = await promptsCollection
+      .find(query)
+      .sort(sortQuery)
+      .skip(skip)
+      .limit(limitNum)
+      .toArray();
+
+    res.send({
+      prompts,
+      totalCount,
+      totalPages: Math.ceil(totalCount / limitNum),
+      currentPage: pageNum,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Failed to load prompts" });
+  }
+});
+
+// ---- GET /api/prompts/:id ----
+// Prompt Details পেজের জন্য — একটা single prompt তার সব ডিটেইল সহ
+app.get('/api/prompts/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({ message: "Invalid prompt id" });
+    }
+
+    const prompt = await promptsCollection.findOne({ _id: new ObjectId(id) });
+
+    if (!prompt) {
+      return res.status(404).send({ message: "Prompt not found" });
+    }
+
+    res.send(prompt);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Failed to load prompt details" });
+  }
+});
+
+// ---- PATCH /api/prompts/:id/copy ----
+// Copy Prompt বাটনে ক্লিক করলে কপি কাউন্ট ১ বাড়াবে
+app.patch('/api/prompts/:id/copy', async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({ message: "Invalid prompt id" });
+    }
+
+    const result = await promptsCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $inc: { copyCount: 1 } }
+    );
+
+    res.send(result);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Failed to update copy count" });
+  }
+});
+
 app.get('/', (req, res) => {
-
-  res.send('Hello World!')
-
-})
+  res.send('Hello World!');
+});
 
 // Initialize server
 connectDB().then(() => {
   app.listen(port, () => console.log(`Server running on port ${port}`));
 }).catch(console.dir);
-
-
