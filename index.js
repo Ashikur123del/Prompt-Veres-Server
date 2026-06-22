@@ -5,7 +5,7 @@ const cors = require('cors');
 require('dotenv').config();
 
 const app = express();
-const port = process.env.PORT || 7000;
+const port = process.env.PORT || 5000;
 
 app.use(cors({
   origin: process.env.CLIENT_URL || "http://localhost:3000",
@@ -20,6 +20,8 @@ const client = new MongoClient(process.env.MONGO_DB_URI, {
 // Use a variable to store the collection reference
 let promptsCollection;
 let usersCollection;
+let bookmarksCollection;
+let reviewsCollection;
 
 // ---- JWT verify middleware ----
 // Authorization header-এ "Bearer <token>" না থাকলে বা টোকেন invalid হলে রিকোয়েস্ট ব্লক করবে
@@ -43,6 +45,8 @@ async function connectDB() {
   await client.connect();
   promptsCollection = client.db("Prompt_Verse").collection("prompts");
   usersCollection = client.db("Prompt_Verse").collection("user"); // better-auth ডিফল্ট কালেকশন নাম
+  bookmarksCollection = client.db("Prompt_Verse").collection("bookmarks");
+  reviewsCollection = client.db("Prompt_Verse").collection("reviews");
   console.log("Connected to MongoDB!");
 }
 
@@ -219,6 +223,144 @@ app.get('/api/prompts', async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).send({ message: "Failed to load prompts" });
+  }
+});
+
+// ---- GET /api/prompts/my-prompts ----
+// লগইন করা ইউজারের নিজের সব prompt — JWT দিয়ে প্রোটেক্টেড
+// ⚠️ এই রুট অবশ্যই /api/prompts/:id রুটের ওপরে থাকতে হবে, না হলে Express
+// "my-prompts"-কে একটা :id মনে করে ভুল হ্যান্ডলারে পাঠাবে
+app.get('/api/prompts/my-prompts', verifyToken, async (req, res) => {
+  try {
+    const result = await promptsCollection
+      .find({ creatorEmail: req.decoded.email })
+      .sort({ createdAt: -1 })
+      .toArray();
+    res.send(result);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Failed to load your prompts" });
+  }
+});
+
+// ---- PATCH /api/prompts/:id ----
+// নিজের prompt আপডেট — মালিক ছাড়া কেউ আপডেট করতে পারবে না
+app.patch('/api/prompts/:id', verifyToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({ message: "Invalid prompt id" });
+    }
+
+    const existingPrompt = await promptsCollection.findOne({ _id: new ObjectId(id) });
+    if (!existingPrompt) {
+      return res.status(404).send({ message: "Prompt not found" });
+    }
+    if (existingPrompt.creatorEmail !== req.decoded.email) {
+      return res.status(403).send({ message: "Forbidden access" });
+    }
+
+    const updateData = { ...req.body };
+    delete updateData._id; // _id কখনো ওভাররাইট করা যাবে না
+    delete updateData.copyCount; // copyCount শুধু /copy রুট দিয়েই বাড়বে
+    updateData.status = "pending"; // এডিট করলে আবার অ্যাডমিন রিভিউয়ে যাবে
+
+    const result = await promptsCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: updateData }
+    );
+    res.send(result);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Failed to update prompt" });
+  }
+});
+
+// ---- DELETE /api/prompts/:id ----
+// নিজের prompt ডিলিট — মালিক ছাড়া কেউ ডিলিট করতে পারবে না
+app.delete('/api/prompts/:id', verifyToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({ message: "Invalid prompt id" });
+    }
+
+    const existingPrompt = await promptsCollection.findOne({ _id: new ObjectId(id) });
+    if (!existingPrompt) {
+      return res.status(404).send({ message: "Prompt not found" });
+    }
+    if (existingPrompt.creatorEmail !== req.decoded.email) {
+      return res.status(403).send({ message: "Forbidden access" });
+    }
+
+    const result = await promptsCollection.deleteOne({ _id: new ObjectId(id) });
+    res.send(result);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Failed to delete prompt" });
+  }
+});
+
+// ---- POST /api/bookmarks ----
+// Bookmark টগল — আগে থেকে থাকলে রিমুভ, না থাকলে অ্যাড (duplicate প্রিভেন্ট করে)
+app.post('/api/bookmarks', verifyToken, async (req, res) => {
+  try {
+    const { promptId } = req.body;
+    const email = req.decoded.email;
+
+    const existing = await bookmarksCollection.findOne({ promptId, email });
+
+    if (existing) {
+      await bookmarksCollection.deleteOne({ _id: existing._id });
+      return res.send({ bookmarked: false, message: "Bookmark removed" });
+    }
+
+    await bookmarksCollection.insertOne({ promptId, email, createdAt: new Date() });
+    res.send({ bookmarked: true, message: "Prompt bookmarked" });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Failed to update bookmark" });
+  }
+});
+
+// ---- GET /api/bookmarks ----
+// লগইন করা ইউজারের সব bookmarked prompt — bookmark + আসল prompt ডেটা একসাথে ($lookup)
+app.get('/api/bookmarks', verifyToken, async (req, res) => {
+  try {
+    const result = await bookmarksCollection
+      .aggregate([
+        { $match: { email: req.decoded.email } },
+        {
+          $lookup: {
+            from: "prompts",
+            localField: "promptId",
+            foreignField: "_id", // ⚠️ promptId স্ট্রিং আকারে সেভ হলে এখানে $toObjectId লাগবে — client থেকে কীভাবে পাঠানো হচ্ছে চেক করো
+            as: "prompt",
+          },
+        },
+        { $unwind: "$prompt" },
+      ])
+      .toArray();
+
+    res.send(result);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Failed to load bookmarks" });
+  }
+});
+
+// ---- GET /api/reviews/my-reviews ----
+// লগইন করা ইউজারের নিজের লেখা সব রিভিউ
+app.get('/api/reviews/my-reviews', verifyToken, async (req, res) => {
+  try {
+    const result = await reviewsCollection
+      .find({ reviewerEmail: req.decoded.email })
+      .sort({ createdAt: -1 })
+      .toArray();
+    res.send(result);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Failed to load your reviews" });
   }
 });
 
