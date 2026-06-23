@@ -1,6 +1,6 @@
 const express = require('express');
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
-const jwt = require('jsonwebtoken');
+const { jwtVerify, createRemoteJWKSet } = require('jose');
 const cors = require('cors');
 require('dotenv').config();
 
@@ -23,22 +23,37 @@ let usersCollection;
 let bookmarksCollection;
 let reviewsCollection;
 
-// ---- JWT verify middleware ----
-// Authorization header-এ "Bearer <token>" না থাকলে বা টোকেন invalid হলে রিকোয়েস্ট ব্লক করবে
-const verifyToken = (req, res, next) => {
+// ---- JWKS verify middleware (better-auth jwt plugin) ----
+// JWT_SECRET-এর বদলে এখন Next.js অ্যাপের /api/auth/jwks থেকে public key এনে verify করে।
+// ⚠️ lazy-init করা হচ্ছে (top-level এ না) যাতে env var মিসিং থাকলে পুরো সার্ভার ক্র্যাশ না করে,
+// শুধু protected রুটে রিকোয়েস্ট এলে error দেখাবে — debug করা সহজ হবে।
+const AUTH_SERVER_URL = process.env.AUTH_SERVER_URL || "http://localhost:3000";
+console.log("AUTH_SERVER_URL is set to:", AUTH_SERVER_URL); // স্টার্টআপে চেক করার জন্য
+
+let _jwks;
+const getJWKS = () => {
+  if (!_jwks) {
+    _jwks = createRemoteJWKSet(new URL(`${AUTH_SERVER_URL}/api/auth/jwks`));
+  }
+  return _jwks;
+};
+
+const verifyToken = async (req, res, next) => {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
     return res.status(401).send({ message: "Unauthorized access" });
   }
 
   const token = authHeader.split(" ")[1];
-  jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
-    if (err) {
-      return res.status(403).send({ message: "Forbidden access" });
-    }
-    req.decoded = decoded; // { email } — সাইন করার সময় যা পাঠানো হয়েছিল
+
+  try {
+    const { payload } = await jwtVerify(token, getJWKS());
+    req.decoded = payload; // { email, sub, ... } — better-auth ডিফল্টে যা পাঠায়
     next();
-  });
+  } catch (err) {
+    console.error("JWT verify failed:", err.message);
+    return res.status(403).send({ message: "Forbidden access" });
+  }
 };
 
 async function connectDB() {
@@ -113,17 +128,6 @@ app.get('/api/creators/top', async (req, res) => {
     console.error(error);
     res.status(500).send({ message: "Failed to load top creators" });
   }
-});
-
-// ---- POST /jwt ----
-// Login/Register-এর পর ক্লায়েন্ট থেকে কল হবে — এই token Express-এর protected রুটে লাগবে
-app.post('/jwt', (req, res) => {
-  const { email } = req.body;
-  if (!email) {
-    return res.status(400).send({ message: "Email is required" });
-  }
-  const token = jwt.sign({ email }, process.env.JWT_SECRET, { expiresIn: "7d" });
-  res.send({ token });
 });
 
 // ---- POST /api/prompts ----
