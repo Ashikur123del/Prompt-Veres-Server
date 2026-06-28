@@ -22,6 +22,8 @@ let promptsCollection;
 let usersCollection;
 let bookmarksCollection;
 let reviewsCollection;
+let reportsCollection;
+let paymentsCollection;
 
 // ---- JWKS verify middleware (better-auth jwt plugin) ----
 // JWT_SECRET-এর বদলে এখন Next.js অ্যাপের /api/auth/jwks থেকে public key এনে verify করে।
@@ -56,12 +58,27 @@ const verifyToken = async (req, res, next) => {
   }
 };
 
+// ---- verifyAdmin ----
+// verifyToken-এর পরে চলবে — DB-তে গিয়ে আসলেই role: "admin" কিনা চেক করে
+// (token-এর payload-এ role থাকলেও সেটাকে বিশ্বাস না করে DB-তেই কনফার্ম করা ভালো — সিকিউরিটির জন্য)
+const verifyAdmin = async (req, res, next) => {
+  const email = req.decoded.email;
+  const user = await usersCollection.findOne({ email });
+
+  if (user?.role !== "admin") {
+    return res.status(403).send({ message: "Admin access only" });
+  }
+  next();
+};
+
 async function connectDB() {
   await client.connect();
   promptsCollection = client.db("Prompt_Verse").collection("prompts");
   usersCollection = client.db("Prompt_Verse").collection("user"); // better-auth ডিফল্ট কালেকশন নাম
   bookmarksCollection = client.db("Prompt_Verse").collection("bookmarks");
   reviewsCollection = client.db("Prompt_Verse").collection("reviews");
+  reportsCollection = client.db("Prompt_Verse").collection("reports");
+  paymentsCollection = client.db("Prompt_Verse").collection("payments");
   console.log("Connected to MongoDB!");
 }
 
@@ -335,10 +352,15 @@ app.get('/api/bookmarks', verifyToken, async (req, res) => {
       .aggregate([
         { $match: { email: req.decoded.email } },
         {
+          // promptId স্ট্রিং আকারে সেভ আছে, কিন্তু prompts._id হলো ObjectId —
+          // $toObjectId দিয়ে কনভার্ট করে তারপর $lookup করতে হবে, না হলে কখনো ম্যাচ হবে না
+          $addFields: { promptObjectId: { $toObjectId: "$promptId" } },
+        },
+        {
           $lookup: {
             from: "prompts",
-            localField: "promptId",
-            foreignField: "_id", // ⚠️ promptId স্ট্রিং আকারে সেভ হলে এখানে $toObjectId লাগবে — client থেকে কীভাবে পাঠানো হচ্ছে চেক করো
+            localField: "promptObjectId",
+            foreignField: "_id",
             as: "prompt",
           },
         },
@@ -409,6 +431,251 @@ app.patch('/api/prompts/:id/copy', async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).send({ message: "Failed to update copy count" });
+  }
+});
+
+// ===================== Admin Routes =====================
+
+// ---- GET /api/admin/users ----
+app.get('/api/admin/users', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const users = await usersCollection.find().sort({ createdAt: -1 }).toArray();
+    res.send(users);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Failed to load users" });
+  }
+});
+
+// ---- PATCH /api/admin/users/:id/role ----
+app.patch('/api/admin/users/:id/role', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { role } = req.body;
+
+    if (!["user", "creator", "admin"].includes(role)) {
+      return res.status(400).send({ message: "Invalid role" });
+    }
+
+    // ⚠️ user collection-এর _id better-auth-এর generated string id (ObjectId না),
+    // তাই new ObjectId(id) করলে BSONError ক্র্যাশ করবে — plain string-ই ব্যবহার করো
+    const result = await usersCollection.updateOne(
+      { _id: id },
+      { $set: { role } }
+    );
+    res.send(result);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Failed to update role" });
+  }
+});
+
+// ---- DELETE /api/admin/users/:id ----
+app.delete('/api/admin/users/:id', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await usersCollection.deleteOne({ _id: id }); // একই কারণে plain string
+    res.send(result);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Failed to delete user" });
+  }
+});
+
+// ---- GET /api/admin/prompts ----
+// সব prompt — যেকোনো status (pending/approved/rejected) — অ্যাডমিন রিভিউ করার জন্য
+app.get('/api/admin/prompts', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const prompts = await promptsCollection.find().sort({ createdAt: -1 }).toArray();
+    res.send(prompts);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Failed to load prompts" });
+  }
+});
+
+// ---- PATCH /api/admin/prompts/:id/status ----
+// Approve / Reject (reject হলে feedback আবশ্যক — doc অনুযায়ী)
+app.patch('/api/admin/prompts/:id/status', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status, feedback } = req.body;
+
+    if (!["approved", "rejected"].includes(status)) {
+      return res.status(400).send({ message: "Invalid status" });
+    }
+    if (status === "rejected" && !feedback) {
+      return res.status(400).send({ message: "Rejection feedback is required" });
+    }
+
+    const updateDoc = { status };
+    if (status === "rejected") updateDoc.rejectionFeedback = feedback;
+
+    const result = await promptsCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: updateDoc }
+    );
+    res.send(result);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Failed to update prompt status" });
+  }
+});
+
+// ---- PATCH /api/admin/prompts/:id/feature ----
+app.patch('/api/admin/prompts/:id/feature', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const prompt = await promptsCollection.findOne({ _id: new ObjectId(id) });
+
+    const result = await promptsCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { isFeatured: !prompt?.isFeatured } }
+    );
+    res.send(result);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Failed to update feature status" });
+  }
+});
+
+// ---- DELETE /api/admin/prompts/:id ----
+app.delete('/api/admin/prompts/:id', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await promptsCollection.deleteOne({ _id: new ObjectId(id) });
+    res.send(result);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Failed to delete prompt" });
+  }
+});
+
+// ---- GET /api/admin/payments ----
+app.get('/api/admin/payments', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const payments = await paymentsCollection.find().sort({ date: -1 }).toArray();
+    res.send(payments);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Failed to load payments" });
+  }
+});
+
+// ---- GET /api/admin/reports ----
+app.get('/api/admin/reports', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const reports = await reportsCollection
+      .aggregate([
+        { $sort: { createdAt: -1 } },
+        {
+          $lookup: {
+            from: "prompts",
+            localField: "promptId",
+            foreignField: "_id",
+            as: "prompt",
+          },
+        },
+        { $unwind: { path: "$prompt", preserveNullAndEmptyArrays: true } },
+      ])
+      .toArray();
+    res.send(reports);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Failed to load reports" });
+  }
+});
+
+// ---- PATCH /api/admin/reports/:id ----
+// action: "remove" (prompt ডিলিট করবে) | "warn" (creator-কে warn করবে — placeholder) | "dismiss"
+app.patch('/api/admin/reports/:id', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { action } = req.body;
+
+    const report = await reportsCollection.findOne({ _id: new ObjectId(id) });
+    if (!report) return res.status(404).send({ message: "Report not found" });
+
+    if (action === "remove" && report.promptId) {
+      await promptsCollection.deleteOne({ _id: new ObjectId(report.promptId) });
+    }
+
+    const result = await reportsCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { status: action } } // "remove" | "warn" | "dismiss"
+    );
+    res.send(result);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Failed to update report" });
+  }
+});
+
+// ---- GET /api/admin/analytics ----
+app.get('/api/admin/analytics', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const totalUsers = await usersCollection.estimatedDocumentCount();
+    const totalPrompts = await promptsCollection.estimatedDocumentCount();
+    const totalReviews = await reviewsCollection.estimatedDocumentCount();
+
+    const copyAgg = await promptsCollection
+      .aggregate([{ $group: { _id: null, totalCopies: { $sum: "$copyCount" } } }])
+      .toArray();
+
+    res.send({
+      totalUsers,
+      totalPrompts,
+      totalReviews,
+      totalCopies: copyAgg[0]?.totalCopies || 0,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Failed to load analytics" });
+  }
+});
+
+// ===================== Creator Routes =====================
+
+// ---- GET /api/creator/analytics ----
+// লগইন করা creator-এর নিজের summary cards + চার্টের ডেটা
+app.get('/api/creator/analytics', verifyToken, async (req, res) => {
+  try {
+    const email = req.decoded.email;
+
+    const myPrompts = await promptsCollection.find({ creatorEmail: email }).toArray();
+
+    const totalPrompts = myPrompts.length;
+    const totalCopies = myPrompts.reduce((sum, p) => sum + (p.copyCount || 0), 0);
+
+    const promptIds = myPrompts.map((p) => p._id.toString());
+    const totalBookmarks = await bookmarksCollection.countDocuments({
+      promptId: { $in: promptIds },
+    });
+
+    // ---- Prompt growth: মাস অনুযায়ী কতগুলো prompt যুক্ত হয়েছে (চার্টের জন্য) ----
+    const growthMap = {};
+    myPrompts.forEach((p) => {
+      const month = new Date(p.createdAt).toLocaleString("en-US", {
+        month: "short",
+        year: "2-digit",
+      });
+      growthMap[month] = (growthMap[month] || 0) + 1;
+    });
+    const promptGrowth = Object.entries(growthMap).map(([month, count]) => ({
+      month,
+      count,
+    }));
+
+    // ---- Copies per prompt (চার্টের জন্য) ----
+    const copiesByPrompt = myPrompts.map((p) => ({
+      title: p.title?.slice(0, 18) || "Untitled",
+      copies: p.copyCount || 0,
+    }));
+
+    res.send({ totalPrompts, totalCopies, totalBookmarks, promptGrowth, copiesByPrompt });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Failed to load creator analytics" });
   }
 });
 
