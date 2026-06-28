@@ -457,10 +457,8 @@ app.patch('/api/admin/users/:id/role', verifyToken, verifyAdmin, async (req, res
       return res.status(400).send({ message: "Invalid role" });
     }
 
-    // ⚠️ user collection-এর _id better-auth-এর generated string id (ObjectId না),
-    // তাই new ObjectId(id) করলে BSONError ক্র্যাশ করবে — plain string-ই ব্যবহার করো
     const result = await usersCollection.updateOne(
-      { _id: id },
+      { _id: new ObjectId(id) },
       { $set: { role } }
     );
     res.send(result);
@@ -474,7 +472,7 @@ app.patch('/api/admin/users/:id/role', verifyToken, verifyAdmin, async (req, res
 app.delete('/api/admin/users/:id', verifyToken, verifyAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    const result = await usersCollection.deleteOne({ _id: id }); // একই কারণে plain string
+    const result = await usersCollection.deleteOne({ _id: new ObjectId(id) });
     res.send(result);
   } catch (error) {
     console.error(error);
