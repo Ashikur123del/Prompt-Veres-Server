@@ -1,3 +1,6 @@
+const dns = require('node:dns');
+dns.setServers(['8.8.8.8', '8.8.4.4']);
+
 const express = require('express');
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 const { jwtVerify, createRemoteJWKSet } = require('jose');
@@ -493,9 +496,6 @@ app.get('/api/reviews/my-reviews', verifyToken, async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).send({ message: "Failed to load your reviews" });
-  }
-});
-
   }
 });
 
