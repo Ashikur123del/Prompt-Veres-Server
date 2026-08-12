@@ -2,15 +2,63 @@ const express = require('express');
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 const { jwtVerify, createRemoteJWKSet } = require('jose');
 const cors = require('cors');
+const Stripe = require('stripe');
 require('dotenv').config();
 
 const app = express();
 const port = process.env.PORT || 5000;
+const stripe = process.env.STRIPE_SECRET_KEY
+  ? new Stripe(process.env.STRIPE_SECRET_KEY)
+  : null;
 
 app.use(cors({
   origin: process.env.CLIENT_URL || "http://localhost:3000",
-  credentials: true, // session cookie পাঠানোর জন্য জরুরি — wildcard "*" দিয়ে এটা কাজ করবে না
+  credentials: true,
 }));
+
+// Stripe webhook needs raw body — must be registered before express.json()
+app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
+  if (!stripe) {
+    return res.status(503).send({ message: "Stripe is not configured" });
+  }
+
+  const sig = req.headers['stripe-signature'];
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      sig,
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+  } catch (err) {
+    console.error('Webhook signature verification failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    const email = session.customer_email || session.metadata?.email;
+
+    if (email) {
+      await usersCollection.updateOne(
+        { email },
+        { $set: { isPremium: true } }
+      );
+
+      await paymentsCollection.insertOne({
+        transactionId: session.id,
+        email,
+        amount: (session.amount_total || 500) / 100,
+        date: new Date(),
+        status: 'completed',
+      });
+    }
+  }
+
+  res.send({ received: true });
+});
+
 app.use(express.json());
 
 const client = new MongoClient(process.env.MONGO_DB_URI, {
@@ -85,15 +133,32 @@ async function connectDB() {
 // ===================== Routes =====================
 
 // ---- GET /api/prompts/featured ----
-// Home page-এর জন্য ৬টা featured/trending prompt — approved + public হতে হবে
 app.get('/api/prompts/featured', async (req, res) => {
   try {
-    const result = await promptsCollection
-      .find({ status: "approved", visibility: "public" })
+    const featured = await promptsCollection
+      .find({ status: "approved", visibility: "public", isFeatured: true })
       .sort({ rating: -1, copyCount: -1 })
       .limit(6)
       .toArray();
-    res.send(result);
+
+    if (featured.length >= 6) {
+      return res.send(featured);
+    }
+
+    const remaining = 6 - featured.length;
+    const featuredIds = featured.map((p) => p._id);
+
+    const trending = await promptsCollection
+      .find({
+        status: "approved",
+        visibility: "public",
+        _id: { $nin: featuredIds },
+      })
+      .sort({ rating: -1, copyCount: -1 })
+      .limit(remaining)
+      .toArray();
+
+    res.send([...featured, ...trending]);
   } catch (error) {
     console.error(error);
     res.status(500).send({ message: "Error fetching featured prompts" });
@@ -375,6 +440,47 @@ app.get('/api/bookmarks', verifyToken, async (req, res) => {
   }
 });
 
+// ---- GET /api/users/me ----
+app.get('/api/users/me', verifyToken, async (req, res) => {
+  try {
+    const user = await usersCollection.findOne({ email: req.decoded.email });
+    if (!user) {
+      return res.status(404).send({ message: "User not found" });
+    }
+
+    const totalPrompts = await promptsCollection.countDocuments({
+      creatorEmail: req.decoded.email,
+    });
+
+    res.send({
+      name: user.name,
+      email: user.email,
+      image: user.image,
+      role: user.role || "user",
+      isPremium: user.isPremium === true,
+      totalPrompts,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Failed to load user profile" });
+  }
+});
+
+// ---- GET /api/bookmarks/check/:promptId ----
+app.get('/api/bookmarks/check/:promptId', verifyToken, async (req, res) => {
+  try {
+    const { promptId } = req.params;
+    const existing = await bookmarksCollection.findOne({
+      promptId,
+      email: req.decoded.email,
+    });
+    res.send({ bookmarked: !!existing });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Failed to check bookmark status" });
+  }
+});
+
 // ---- GET /api/reviews/my-reviews ----
 // লগইন করা ইউজারের নিজের লেখা সব রিভিউ
 app.get('/api/reviews/my-reviews', verifyToken, async (req, res) => {
@@ -387,6 +493,182 @@ app.get('/api/reviews/my-reviews', verifyToken, async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).send({ message: "Failed to load your reviews" });
+  }
+});
+
+  }
+});
+
+// ---- GET /api/reviews/recent ----
+app.get('/api/reviews/recent', async (req, res) => {
+  try {
+    const result = await reviewsCollection
+      .find()
+      .sort({ createdAt: -1 })
+      .limit(6)
+      .toArray();
+    res.send(result);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Failed to load recent reviews" });
+  }
+});
+
+// ---- POST /api/reviews ----
+app.post('/api/reviews', verifyToken, async (req, res) => {
+  try {
+    const { promptId, rating, comment } = req.body;
+
+    if (!promptId || !rating || !comment?.trim()) {
+      return res.status(400).send({ message: "promptId, rating, and comment are required" });
+    }
+    if (rating < 1 || rating > 5) {
+      return res.status(400).send({ message: "Rating must be between 1 and 5" });
+    }
+    if (!ObjectId.isValid(promptId)) {
+      return res.status(400).send({ message: "Invalid prompt id" });
+    }
+
+    const prompt = await promptsCollection.findOne({ _id: new ObjectId(promptId) });
+    if (!prompt) {
+      return res.status(404).send({ message: "Prompt not found" });
+    }
+
+    const user = await usersCollection.findOne({ email: req.decoded.email });
+
+    const existingReview = await reviewsCollection.findOne({
+      promptId,
+      reviewerEmail: req.decoded.email,
+    });
+    if (existingReview) {
+      return res.status(400).send({ message: "You have already reviewed this prompt" });
+    }
+
+    const review = {
+      promptId,
+      promptTitle: prompt.title,
+      reviewerEmail: req.decoded.email,
+      reviewerName: user?.name || "Anonymous",
+      rating: Number(rating),
+      comment: comment.trim(),
+      createdAt: new Date(),
+    };
+
+    await reviewsCollection.insertOne(review);
+
+    const ratingAgg = await reviewsCollection
+      .aggregate([
+        { $match: { promptId } },
+        { $group: { _id: null, avgRating: { $avg: "$rating" } } },
+      ])
+      .toArray();
+
+    const avgRating = ratingAgg[0]?.avgRating || rating;
+    await promptsCollection.updateOne(
+      { _id: new ObjectId(promptId) },
+      { $set: { rating: Math.round(avgRating * 10) / 10 } }
+    );
+
+    res.status(201).send(review);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Failed to submit review" });
+  }
+});
+
+// ---- GET /api/reviews/:promptId ----
+app.get('/api/reviews/:promptId', async (req, res) => {
+  try {
+    const { promptId } = req.params;
+    if (!ObjectId.isValid(promptId)) {
+      return res.status(400).send({ message: "Invalid prompt id" });
+    }
+
+    const result = await reviewsCollection
+      .find({ promptId })
+      .sort({ createdAt: -1 })
+      .toArray();
+    res.send(result);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Failed to load reviews" });
+  }
+});
+
+// ---- POST /api/reports ----
+app.post('/api/reports', verifyToken, async (req, res) => {
+  try {
+    const { promptId, reason, description } = req.body;
+
+    if (!promptId || !reason) {
+      return res.status(400).send({ message: "promptId and reason are required" });
+    }
+    if (!ObjectId.isValid(promptId)) {
+      return res.status(400).send({ message: "Invalid prompt id" });
+    }
+
+    const prompt = await promptsCollection.findOne({ _id: new ObjectId(promptId) });
+    if (!prompt) {
+      return res.status(404).send({ message: "Prompt not found" });
+    }
+
+    const report = {
+      promptId: new ObjectId(promptId),
+      reason,
+      description: description?.trim() || "",
+      reporterEmail: req.decoded.email,
+      status: "pending",
+      createdAt: new Date(),
+    };
+
+    await reportsCollection.insertOne(report);
+    res.status(201).send({ message: "Report submitted successfully" });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Failed to submit report" });
+  }
+});
+
+// ---- POST /api/payments/create-checkout-session ----
+app.post('/api/payments/create-checkout-session', verifyToken, async (req, res) => {
+  try {
+    if (!stripe) {
+      return res.status(503).send({ message: "Stripe is not configured" });
+    }
+
+    const user = await usersCollection.findOne({ email: req.decoded.email });
+    if (user?.isPremium) {
+      return res.status(400).send({ message: "You already have Premium access" });
+    }
+
+    const clientUrl = process.env.CLIENT_URL || "http://localhost:3000";
+
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      mode: 'payment',
+      customer_email: req.decoded.email,
+      line_items: [
+        {
+          price_data: {
+            currency: 'usd',
+            product_data: {
+              name: 'PromptVerse Premium',
+              description: 'Unlock all private/premium prompts',
+            },
+            unit_amount: 500,
+          },
+          quantity: 1,
+        },
+      ],
+      metadata: { email: req.decoded.email },
+      success_url: `${clientUrl}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${clientUrl}/payment`,
+    });
+
+    res.send({ url: session.url, sessionId: session.id });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Failed to create checkout session" });
   }
 });
 
