@@ -1,18 +1,23 @@
-const dns = require('node:dns');
-dns.setServers(['8.8.8.8', '8.8.4.4']);
-
 const express = require('express');
+const path = require('path');
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 const { jwtVerify, createRemoteJWKSet } = require('jose');
 const cors = require('cors');
 const Stripe = require('stripe');
-require('dotenv').config();
+const { resolveMongoUri } = require('./resolve-mongo-uri');
+
+require('dotenv').config({ path: path.join(__dirname, '.env') });
 
 const app = express();
 const port = process.env.PORT || 5000;
-const stripe = process.env.STRIPE_SECRET_KEY
-  ? new Stripe(process.env.STRIPE_SECRET_KEY)
-  : null;
+
+function getStripe() {
+  const key = process.env.STRIPE_SECRET_KEY?.trim();
+  if (!key) return null;
+  return new Stripe(key);
+}
+
+console.log('Stripe configured:', Boolean(getStripe()));
 
 app.use(cors({
   origin: process.env.CLIENT_URL || "http://localhost:3000",
@@ -21,6 +26,7 @@ app.use(cors({
 
 // Stripe webhook needs raw body — must be registered before express.json()
 app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
+  const stripe = getStripe();
   if (!stripe) {
     return res.status(503).send({ message: "Stripe is not configured" });
   }
@@ -64,11 +70,7 @@ app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), asyn
 
 app.use(express.json());
 
-const client = new MongoClient(process.env.MONGO_DB_URI, {
-  serverApi: { version: ServerApiVersion.v1, strict: true, deprecationErrors: true }
-});
-
-// Use a variable to store the collection reference
+let client;
 let promptsCollection;
 let usersCollection;
 let bookmarksCollection;
@@ -76,20 +78,34 @@ let reviewsCollection;
 let reportsCollection;
 let paymentsCollection;
 
-// ---- JWKS verify middleware (better-auth jwt plugin) ----
-// JWT_SECRET-এর বদলে এখন Next.js অ্যাপের /api/auth/jwks থেকে public key এনে verify করে।
-// ⚠️ lazy-init করা হচ্ছে (top-level এ না) যাতে env var মিসিং থাকলে পুরো সার্ভার ক্র্যাশ না করে,
-// শুধু protected রুটে রিকোয়েস্ট এলে error দেখাবে — debug করা সহজ হবে।
+
 const AUTH_SERVER_URL = process.env.AUTH_SERVER_URL || "http://localhost:3000";
-console.log("AUTH_SERVER_URL is set to:", AUTH_SERVER_URL); // স্টার্টআপে চেক করার জন্য
+console.log("AUTH_SERVER_URL is set to:", AUTH_SERVER_URL);
 
 let _jwks;
-const getJWKS = () => {
-  if (!_jwks) {
-    _jwks = createRemoteJWKSet(new URL(`${AUTH_SERVER_URL}/api/auth/jwks`));
+const getJWKS = (forceRefresh = false) => {
+  if (!_jwks || forceRefresh) {
+    _jwks = createRemoteJWKSet(new URL(`${AUTH_SERVER_URL}/api/auth/jwks`), {
+      cooldownDuration: 0,
+    });
   }
   return _jwks;
 };
+
+async function findUserFromDecoded(decoded) {
+  if (!decoded) return null;
+
+  if (decoded.email) {
+    const byEmail = await usersCollection.findOne({ email: decoded.email });
+    if (byEmail) return byEmail;
+  }
+
+  if (decoded.sub && ObjectId.isValid(String(decoded.sub))) {
+    return usersCollection.findOne({ _id: new ObjectId(String(decoded.sub)) });
+  }
+
+  return null;
+}
 
 const verifyToken = async (req, res, next) => {
   const authHeader = req.headers.authorization;
@@ -99,21 +115,46 @@ const verifyToken = async (req, res, next) => {
 
   const token = authHeader.split(" ")[1];
 
+  const attachUser = async (payload) => {
+    const user = await findUserFromDecoded(payload);
+
+    req.decoded = {
+      ...payload,
+      email: user?.email || payload.email,
+      role: user?.role || payload.role,
+      sub: payload.sub,
+    };
+  };
+
   try {
-    const { payload } = await jwtVerify(token, getJWKS());
-    req.decoded = payload; // { email, sub, ... } — better-auth ডিফল্টে যা পাঠায়
+    const { payload } = await jwtVerify(token, getJWKS(), {
+      issuer: AUTH_SERVER_URL,
+      audience: AUTH_SERVER_URL,
+    });
+    await attachUser(payload);
     next();
   } catch (err) {
-    console.error("JWT verify failed:", err.message);
-    return res.status(403).send({ message: "Forbidden access" });
+    try {
+      const { payload } = await jwtVerify(token, getJWKS(true), {
+        issuer: AUTH_SERVER_URL,
+        audience: AUTH_SERVER_URL,
+      });
+      await attachUser(payload);
+      return next();
+    } catch (retryErr) {
+      console.error("JWT verify failed:", retryErr.message);
+      return res.status(403).send({ message: "Forbidden access" });
+    }
   }
 };
 
 // ---- verifyAdmin ----
-// verifyToken-এর পরে চলবে — DB-তে গিয়ে আসলেই role: "admin" কিনা চেক করে
-// (token-এর payload-এ role থাকলেও সেটাকে বিশ্বাস না করে DB-তেই কনফার্ম করা ভালো — সিকিউরিটির জন্য)
 const verifyAdmin = async (req, res, next) => {
-  const email = req.decoded.email;
+  const email = req.decoded?.email;
+  if (!email) {
+    return res.status(403).send({ message: "Admin access only" });
+  }
+
   const user = await usersCollection.findOne({ email });
 
   if (user?.role !== "admin") {
@@ -123,6 +164,10 @@ const verifyAdmin = async (req, res, next) => {
 };
 
 async function connectDB() {
+  const mongoUri = await resolveMongoUri(process.env.MONGO_DB_URI);
+  client = new MongoClient(mongoUri, {
+    serverApi: { version: ServerApiVersion.v1, strict: true, deprecationErrors: true },
+  });
   await client.connect();
   promptsCollection = client.db("Prompt_Verse").collection("prompts");
   usersCollection = client.db("Prompt_Verse").collection("user"); // better-auth ডিফল্ট কালেকশন নাম
@@ -169,9 +214,6 @@ app.get('/api/prompts/featured', async (req, res) => {
 });
 
 // ---- GET /api/creators/top ----
-// MongoDB aggregation: prompts collection-এ creatorId দিয়ে গ্রুপ করে total prompts +
-// total copies বের করা হয়, তারপর $lookup দিয়ে users collection থেকে নাম/ছবি/role আনা হয়।
-// ⚠️ ধরে নিচ্ছি prompts ডকুমেন্টে creatorId একটা ObjectId যা user._id-কে রেফার করে।
 app.get('/api/creators/top', async (req, res) => {
   try {
     const result = await promptsCollection
@@ -187,22 +229,34 @@ app.get('/api/creators/top', async (req, res) => {
         { $sort: { totalCopies: -1 } },
         { $limit: 3 },
         {
+          $addFields: {
+            creatorObjectId: {
+              $convert: {
+                input: "$_id",
+                to: "objectId",
+                onError: null,
+                onNull: null,
+              },
+            },
+          },
+        },
+        {
           $lookup: {
             from: "user",
-            localField: "_id",
+            localField: "creatorObjectId",
             foreignField: "_id",
             as: "creator",
           },
         },
-        { $unwind: "$creator" },
+        { $unwind: { path: "$creator", preserveNullAndEmptyArrays: true } },
         {
           $project: {
             _id: 1,
             totalPrompts: 1,
             totalCopies: 1,
-            name: "$creator.name",
+            name: { $ifNull: ["$creator.name", "Unknown Creator"] },
             image: "$creator.image",
-            role: "$creator.role",
+            role: { $ifNull: ["$creator.role", "creator"] },
           },
         },
       ])
@@ -216,7 +270,6 @@ app.get('/api/creators/top', async (req, res) => {
 });
 
 // ---- POST /api/prompts ----
-// নতুন prompt তৈরি — JWT দিয়ে প্রোটেক্টেড, status:"pending" + copyCount:0 ফোর্স করা হয়
 app.post('/api/prompts', verifyToken, async (req, res) => {
   try {
     const promptData = req.body;
@@ -257,8 +310,7 @@ app.post('/api/prompts', verifyToken, async (req, res) => {
   }
 });
 
-// ---- GET /api/prompts ----
-// All Prompts পেজের জন্য — server-side search + filter + sort + pagination, সব এক রুটে
+// ---- GET /api/prompts ----// 
 app.get('/api/prompts', async (req, res) => {
   try {
     const {
@@ -273,7 +325,6 @@ app.get('/api/prompts', async (req, res) => {
 
     const query = { status: "approved", visibility: { $ne: "private-hidden" } };
 
-    // ---- Search: title, tags, aiTool — তিনটাতেই খুঁজবে ----
     if (search.trim()) {
       const regex = new RegExp(search.trim(), "i");
       query.$or = [{ title: regex }, { tags: regex }, { aiTool: regex }];
@@ -316,9 +367,6 @@ app.get('/api/prompts', async (req, res) => {
 });
 
 // ---- GET /api/prompts/my-prompts ----
-// লগইন করা ইউজারের নিজের সব prompt — JWT দিয়ে প্রোটেক্টেড
-// ⚠️ এই রুট অবশ্যই /api/prompts/:id রুটের ওপরে থাকতে হবে, না হলে Express
-// "my-prompts"-কে একটা :id মনে করে ভুল হ্যান্ডলারে পাঠাবে
 app.get('/api/prompts/my-prompts', verifyToken, async (req, res) => {
   try {
     const result = await promptsCollection
@@ -333,7 +381,6 @@ app.get('/api/prompts/my-prompts', verifyToken, async (req, res) => {
 });
 
 // ---- PATCH /api/prompts/:id ----
-// নিজের prompt আপডেট — মালিক ছাড়া কেউ আপডেট করতে পারবে না
 app.patch('/api/prompts/:id', verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
@@ -350,9 +397,9 @@ app.patch('/api/prompts/:id', verifyToken, async (req, res) => {
     }
 
     const updateData = { ...req.body };
-    delete updateData._id; // _id কখনো ওভাররাইট করা যাবে না
-    delete updateData.copyCount; // copyCount শুধু /copy রুট দিয়েই বাড়বে
-    updateData.status = "pending"; // এডিট করলে আবার অ্যাডমিন রিভিউয়ে যাবে
+    delete updateData._id;
+    delete updateData.copyCount;
+    updateData.status = "pending";
 
     const result = await promptsCollection.updateOne(
       { _id: new ObjectId(id) },
@@ -366,7 +413,6 @@ app.patch('/api/prompts/:id', verifyToken, async (req, res) => {
 });
 
 // ---- DELETE /api/prompts/:id ----
-// নিজের prompt ডিলিট — মালিক ছাড়া কেউ ডিলিট করতে পারবে না
 app.delete('/api/prompts/:id', verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
@@ -391,7 +437,6 @@ app.delete('/api/prompts/:id', verifyToken, async (req, res) => {
 });
 
 // ---- POST /api/bookmarks ----
-// Bookmark টগল — আগে থেকে থাকলে রিমুভ, না থাকলে অ্যাড (duplicate প্রিভেন্ট করে)
 app.post('/api/bookmarks', verifyToken, async (req, res) => {
   try {
     const { promptId } = req.body;
@@ -413,7 +458,6 @@ app.post('/api/bookmarks', verifyToken, async (req, res) => {
 });
 
 // ---- GET /api/bookmarks ----
-// লগইন করা ইউজারের সব bookmarked prompt — bookmark + আসল prompt ডেটা একসাথে ($lookup)
 app.get('/api/bookmarks', verifyToken, async (req, res) => {
   try {
     const result = await bookmarksCollection
@@ -446,13 +490,13 @@ app.get('/api/bookmarks', verifyToken, async (req, res) => {
 // ---- GET /api/users/me ----
 app.get('/api/users/me', verifyToken, async (req, res) => {
   try {
-    const user = await usersCollection.findOne({ email: req.decoded.email });
+    const user = await findUserFromDecoded(req.decoded);
     if (!user) {
       return res.status(404).send({ message: "User not found" });
     }
 
     const totalPrompts = await promptsCollection.countDocuments({
-      creatorEmail: req.decoded.email,
+      creatorEmail: user.email,
     });
 
     res.send({
@@ -485,7 +529,6 @@ app.get('/api/bookmarks/check/:promptId', verifyToken, async (req, res) => {
 });
 
 // ---- GET /api/reviews/my-reviews ----
-// লগইন করা ইউজারের নিজের লেখা সব রিভিউ
 app.get('/api/reviews/my-reviews', verifyToken, async (req, res) => {
   try {
     const result = await reviewsCollection
@@ -632,21 +675,27 @@ app.post('/api/reports', verifyToken, async (req, res) => {
 // ---- POST /api/payments/create-checkout-session ----
 app.post('/api/payments/create-checkout-session', verifyToken, async (req, res) => {
   try {
+    const stripe = getStripe();
     if (!stripe) {
       return res.status(503).send({ message: "Stripe is not configured" });
     }
 
-    const user = await usersCollection.findOne({ email: req.decoded.email });
+    const user = await findUserFromDecoded(req.decoded);
+    if (!user) {
+      return res.status(404).send({ message: "User not found" });
+    }
+
     if (user?.isPremium) {
       return res.status(400).send({ message: "You already have Premium access" });
     }
 
     const clientUrl = process.env.CLIENT_URL || "http://localhost:3000";
+    const userEmail = user.email;
 
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
       mode: 'payment',
-      customer_email: req.decoded.email,
+      customer_email: userEmail,
       line_items: [
         {
           price_data: {
@@ -660,15 +709,70 @@ app.post('/api/payments/create-checkout-session', verifyToken, async (req, res) 
           quantity: 1,
         },
       ],
-      metadata: { email: req.decoded.email },
+      metadata: { email: userEmail },
       success_url: `${clientUrl}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${clientUrl}/payment`,
     });
 
     res.send({ url: session.url, sessionId: session.id });
   } catch (error) {
+    console.error("Stripe checkout error:", error.message);
+    res.status(500).send({ message: error.message || "Failed to create checkout session" });
+  }
+});
+
+// ---- GET /api/payments/verify-session ----
+// Stripe webhook ছাড়া local/dev-এ premium activate করার fallback
+app.get('/api/payments/verify-session', verifyToken, async (req, res) => {
+  try {
+    const stripe = getStripe();
+    if (!stripe) {
+      return res.status(503).send({ message: "Stripe is not configured" });
+    }
+
+    const { session_id: sessionId } = req.query;
+    if (!sessionId) {
+      return res.status(400).send({ message: "session_id is required" });
+    }
+
+    const session = await stripe.checkout.sessions.retrieve(String(sessionId));
+    if (session.payment_status !== "paid") {
+      return res.status(400).send({ message: "Payment not completed yet" });
+    }
+
+    const resolvedEmail =
+      session.customer_email ||
+      session.metadata?.email ||
+      req.decoded.email ||
+      (await findUserFromDecoded(req.decoded))?.email;
+
+    if (!resolvedEmail) {
+      return res.status(400).send({ message: "Could not resolve user email" });
+    }
+
+    await usersCollection.updateOne(
+      { email: resolvedEmail },
+      { $set: { isPremium: true } }
+    );
+
+    const existingPayment = await paymentsCollection.findOne({
+      transactionId: session.id,
+    });
+
+    if (!existingPayment) {
+      await paymentsCollection.insertOne({
+        transactionId: session.id,
+        email: resolvedEmail,
+        amount: (session.amount_total || 500) / 100,
+        date: new Date(),
+        status: "completed",
+      });
+    }
+
+    res.send({ isPremium: true, email: resolvedEmail });
+  } catch (error) {
     console.error(error);
-    res.status(500).send({ message: "Failed to create checkout session" });
+    res.status(500).send({ message: "Failed to verify payment session" });
   }
 });
 
@@ -721,8 +825,24 @@ app.patch('/api/prompts/:id/copy', async (req, res) => {
 // ---- GET /api/admin/users ----
 app.get('/api/admin/users', verifyToken, verifyAdmin, async (req, res) => {
   try {
-    const users = await usersCollection.find().sort({ createdAt: -1 }).toArray();
-    res.send(users);
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const skip = (page - 1) * limit;
+
+    const totalCount = await usersCollection.countDocuments();
+    const users = await usersCollection
+      .find()
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .toArray();
+
+    res.send({
+      users,
+      totalCount,
+      totalPages: Math.ceil(totalCount / limit) || 1,
+      currentPage: page,
+    });
   } catch (error) {
     console.error(error);
     res.status(500).send({ message: "Failed to load users" });
@@ -766,8 +886,24 @@ app.delete('/api/admin/users/:id', verifyToken, verifyAdmin, async (req, res) =>
 // সব prompt — যেকোনো status (pending/approved/rejected) — অ্যাডমিন রিভিউ করার জন্য
 app.get('/api/admin/prompts', verifyToken, verifyAdmin, async (req, res) => {
   try {
-    const prompts = await promptsCollection.find().sort({ createdAt: -1 }).toArray();
-    res.send(prompts);
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const skip = (page - 1) * limit;
+
+    const totalCount = await promptsCollection.countDocuments();
+    const prompts = await promptsCollection
+      .find()
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .toArray();
+
+    res.send({
+      prompts,
+      totalCount,
+      totalPages: Math.ceil(totalCount / limit) || 1,
+      currentPage: page,
+    });
   } catch (error) {
     console.error(error);
     res.status(500).send({ message: "Failed to load prompts" });
