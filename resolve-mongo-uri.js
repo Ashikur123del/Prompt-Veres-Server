@@ -34,7 +34,7 @@ function parseTxtRecords(records) {
     .map((record) => record.data.replace(/^"|"$/g, ""));
 }
 
-async function resolveMongoUri(uri) {
+export async function resolveMongoUri(uri) {
   if (!uri?.startsWith("mongodb+srv://")) {
     return uri;
   }
@@ -74,5 +74,3 @@ async function resolveMongoUri(uri) {
 
   return `mongodb://${credentials}@${hosts}${dbPath}?${params.toString()}`;
 }
-
-module.exports = { resolveMongoUri };
