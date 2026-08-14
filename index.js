@@ -1,12 +1,17 @@
-const express = require('express');
-const path = require('path');
-const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
-const { jwtVerify, createRemoteJWKSet } = require('jose');
-const cors = require('cors');
-const Stripe = require('stripe');
-const { resolveMongoUri } = require('./resolve-mongo-uri');
+import express from 'express';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { MongoClient, ServerApiVersion, ObjectId } from 'mongodb';
+import { jwtVerify, createRemoteJWKSet } from 'jose';
+import cors from 'cors';
+import Stripe from 'stripe';
+import dotenv from 'dotenv';
+import { resolveMongoUri } from './resolve-mongo-uri.js';
 
-require('dotenv').config({ path: path.join(__dirname, '.env') });
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+dotenv.config({ path: path.join(__dirname, '.env') });
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -310,7 +315,7 @@ app.post('/api/prompts', verifyToken, async (req, res) => {
   }
 });
 
-// ---- GET /api/prompts ----// 
+// ---- GET /api/prompts ----
 app.get('/api/prompts', async (req, res) => {
   try {
     const {
