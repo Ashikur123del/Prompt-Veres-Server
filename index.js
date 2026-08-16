@@ -25,16 +25,19 @@ function getStripe() {
 
 const allowedOrigins = [
   'http://localhost:3000',
-  'https://promet-veres-system.vercel.app', // আপনার প্রোডাকশন ফ্রন্টএন্ড URL
+  'http://127.0.0.1:3000',
+  'https://promet-veres-system.vercel.app',
   process.env.CLIENT_URL
-].filter(Boolean); // undefined বা empty মান ফিল্টার করার জন্য
+].filter(Boolean);
 
 console.log('Stripe configured:', Boolean(getStripe()));
 
 app.use(cors({
   origin: function (origin, callback) {
-    // Postman, Server-to-server বা origin ছাড়া রিকোয়েস্ট অ্যালাউ করার জন্য (!origin)
-    if (!origin || allowedOrigins.includes(origin)) {
+    // ১. !origin (Postman, Server-to-server বা Webhook রিকোয়েস্টের জন্য)
+    // ২. allowedOrigins তালিকায় থাকলে
+    // ৩. Vercel-এর যেকোনো Subdomain (Preview Deployment) হলে
+    if (!origin || allowedOrigins.includes(origin) || /\.vercel\.app$/.test(origin)) {
       callback(null, true);
     } else {
       callback(new Error('CORS Policy: Not allowed by CORS'));
