@@ -22,11 +22,27 @@ function getStripe() {
   return new Stripe(key);
 }
 
+
+const allowedOrigins = [
+  'http://localhost:3000',
+  'https://promet-veres-system.vercel.app', // আপনার প্রোডাকশন ফ্রন্টএন্ড URL
+  process.env.CLIENT_URL
+].filter(Boolean); // undefined বা empty মান ফিল্টার করার জন্য
+
 console.log('Stripe configured:', Boolean(getStripe()));
 
 app.use(cors({
-  origin: process.env.CLIENT_URL || "http://localhost:3000",
+  origin: function (origin, callback) {
+    // Postman, Server-to-server বা origin ছাড়া রিকোয়েস্ট অ্যালাউ করার জন্য (!origin)
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('CORS Policy: Not allowed by CORS'));
+    }
+  },
   credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
 // Stripe webhook needs raw body — must be registered before express.json()
