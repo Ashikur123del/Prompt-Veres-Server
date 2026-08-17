@@ -132,12 +132,108 @@ async function findUserFromDecoded(decoded) {
 }
 
 const verifyToken = async (req, res, next) => {
+  // First try Authorization header (Bearer)
   const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+  let token;
+  let tokenSource = null;
+
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    token = authHeader.split(" ")[1];
+    tokenSource = 'authorization';
+  }
+
+  // If no Authorization header, try to find a JWT-looking cookie and verify it
+  if (!token && req.headers.cookie) {
+    const cookieHeader = req.headers.cookie;
+    const cookies = Object.fromEntries(cookieHeader.split(';').map(c => {
+      const [k, ...v] = c.split('=');
+      return [k.trim(), decodeURIComponent(v.join('='))];
+    }));
+
+    // Try common cookie names first
+    const candidateNames = ['better-auth', 'better-auth.session', 'next-auth.session-token', 'access-token', 'session', '__Secure-better-auth.session_token'];
+    for (const name of candidateNames) {
+      if (cookies[name]) {
+        const val = cookies[name];
+        // If this looks like a JWT (three dot-separated parts) use it
+        if (/^[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+$/.test(val)) {
+          token = val;
+          tokenSource = `cookie:${name}`;
+          break;
+        }
+      }
+    }
+
+    // Fallback: scan all cookie values for a JWT-ish value
+    if (!token) {
+      for (const [k,v] of Object.entries(cookies)) {
+        if (/^[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+$/.test(v)) {
+          token = v;
+          tokenSource = `cookie:${k}`;
+          break;
+        }
+      }
+    }
+
+    // If we didn't find a JWT but we do have better-auth cookies, we will treat
+    // the session as opaque and fetch it from the auth server below.
+  }
+
+  // If there is no raw token, try get-session when better-auth cookies are present
+  if (!token) {
+    if (req.headers.cookie && /better-auth|better-auth\.session|__Secure-better-auth/.test(req.headers.cookie)) {
+      try {
+        console.log('verifyToken: no JWT token found, calling auth server get-session');
+        const resp = await fetch(`${AUTH_SERVER_URL}/api/auth/get-session`, {
+          headers: { cookie: req.headers.cookie },
+        });
+        if (resp && resp.ok) {
+          const json = await resp.json();
+          req.decoded = {
+            email: json.user?.email,
+            role: json.user?.role,
+            sub: json.user?.id,
+            session: json.session || null,
+          };
+          console.log(`verifyToken: attached session for email=${req.decoded.email}`);
+          return next();
+        } else {
+          console.warn('verifyToken: get-session returned non-ok', resp && resp.status);
+        }
+      } catch (e) {
+        console.error('get-session call failed:', e?.message || e);
+      }
+    }
+
     return res.status(401).send({ message: "Unauthorized access" });
   }
 
-  const token = authHeader.split(" ")[1];
+  // If token exists but doesn't look like a JWT, fallback to get-session instead of attempting JWT verify
+  const isJwt = /^[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+$/.test(token);
+  if (!isJwt) {
+    // opaque token (not a JWT)
+    if (req.headers.cookie && /better-auth|better-auth\.session|__Secure-better-auth/.test(req.headers.cookie)) {
+      try {
+        console.log('verifyToken: token appears opaque, calling get-session as fallback');
+        const resp = await fetch(`${AUTH_SERVER_URL}/api/auth/get-session`, { headers: { cookie: req.headers.cookie } });
+        if (resp && resp.ok) {
+          const json = await resp.json();
+          req.decoded = {
+            email: json.user?.email,
+            role: json.user?.role,
+            sub: json.user?.id,
+            session: json.session || null,
+          };
+          console.log(`verifyToken: attached session (opaque token) for email=${req.decoded.email}`);
+          return next();
+        }
+      } catch (e) {
+        console.error('verifyToken fallback get-session failed:', e?.message || e);
+      }
+    }
+    // If fallback didn't work, treat as unauthorized
+    return res.status(403).send({ message: "Forbidden access" });
+  }
 
   const attachUser = async (payload) => {
     const user = await findUserFromDecoded(payload);
@@ -150,7 +246,9 @@ const verifyToken = async (req, res, next) => {
     };
   };
 
+  // At this point token is a JWT — try verifying
   try {
+    console.log(`verifyToken: attempting jwtVerify (source=${tokenSource || 'cookie'})`);
     const { payload } = await jwtVerify(token, getJWKS(), {
       issuer: AUTH_SERVER_URL,
       audience: AUTH_SERVER_URL,
@@ -159,6 +257,7 @@ const verifyToken = async (req, res, next) => {
     next();
   } catch (err) {
     try {
+      console.log('verifyToken: jwtVerify initial failed, retrying with forced JWKS refresh');
       const { payload } = await jwtVerify(token, getJWKS(true), {
         issuer: AUTH_SERVER_URL,
         audience: AUTH_SERVER_URL,
@@ -176,12 +275,15 @@ const verifyToken = async (req, res, next) => {
 const verifyAdmin = async (req, res, next) => {
   const email = req.decoded?.email;
   if (!email) {
+    console.warn('verifyAdmin: no email on req.decoded', { path: req.path });
     return res.status(403).send({ message: "Admin access only" });
   }
 
   const user = await usersCollection.findOne({ email });
+  console.log(`verifyAdmin: request by email=${email}, userRole=${user?.role}`);
 
   if (user?.role !== "admin") {
+    console.warn(`verifyAdmin: forbidden for email=${email}, role=${user?.role}`);
     return res.status(403).send({ message: "Admin access only" });
   }
   next();
@@ -508,6 +610,32 @@ app.get('/api/bookmarks', verifyToken, async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).send({ message: "Failed to load bookmarks" });
+  }
+});
+
+// ---- GET /api/users/me ----
+
+// ---- INTERNAL: GET /internal/user?email=... (local dev helper) ----
+app.get('/internal/user', async (req, res) => {
+  try {
+    const remote = req.ip || req.connection?.remoteAddress || req.headers['x-forwarded-for'];
+    // Allow only localhost requests
+    if (!remote || !(remote === '::1' || remote === '127.0.0.1' || remote.endsWith('::1') || remote.startsWith('127.')) ) {
+      return res.status(403).send({ message: 'Forbidden' });
+    }
+
+    const { email } = req.query;
+    if (!email) return res.status(400).send({ message: 'email query required' });
+
+    const user = await usersCollection.findOne({ email: String(email) });
+    if (!user) return res.status(404).send({ message: 'User not found' });
+
+    // Do not return sensitive fields like passwordHash
+    const { passwordHash, ...safe } = user;
+    res.send(safe);
+  } catch (err) {
+    console.error('internal/user error:', err);
+    res.status(500).send({ message: 'internal error' });
   }
 });
 
