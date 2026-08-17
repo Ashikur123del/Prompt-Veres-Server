@@ -34,8 +34,8 @@ console.log('Stripe configured:', Boolean(getStripe()));
 
 app.use(cors({
   origin: function (origin, callback) {
-    // ১. !origin (Postman, Server-to-server বা Webhook রিকোয়েস্টের জন্য)
-    // ২. allowedOrigins তালিকায় থাকলে
+    // ১. !origin (Postman, Server-to-server বা Webhook রিকোয়েস্টের জন্য)
+    // ২. allowedOrigins তালিকায় থাকলে
     // ৩. Vercel-এর যেকোনো Subdomain (Preview Deployment) হলে
     if (!origin || allowedOrigins.includes(origin) || /\.vercel\.app$/.test(origin)) {
       callback(null, true);
@@ -131,8 +131,34 @@ async function findUserFromDecoded(decoded) {
   return null;
 }
 
+async function attachSessionFromAuthServer(req, res, cookieHeader) {
+  try {
+    const resp = await fetch(`${AUTH_SERVER_URL}/api/auth/get-session`, {
+      headers: { cookie: cookieHeader },
+    });
+    if (resp && resp.ok) {
+      const json = await resp.json();
+      if (json?.user) {
+        req.decoded = {
+          email: json.user.email,
+          role: json.user.role,
+          sub: json.user.id,
+          session: json.session || null,
+        };
+        console.log(`verifyToken: attached session for email=${req.decoded.email}`);
+        return true;
+      }
+    } else {
+      console.warn('verifyToken: get-session returned non-ok', resp && resp.status);
+    }
+  } catch (e) {
+    console.error('get-session call failed:', e?.message || e);
+  }
+  return false;
+}
+
 const verifyToken = async (req, res, next) => {
-  // First try Authorization header (Bearer)
+  // 1) Authorization: Bearer <jwt>
   const authHeader = req.headers.authorization;
   let token;
   let tokenSource = null;
@@ -142,97 +168,46 @@ const verifyToken = async (req, res, next) => {
     tokenSource = 'authorization';
   }
 
-  // If no Authorization header, try to find a JWT-looking cookie and verify it
-  if (!token && req.headers.cookie) {
-    const cookieHeader = req.headers.cookie;
+  const cookieHeader = req.headers.cookie || "";
+  const hasBetterAuthCookie = /better-auth\.session|__Secure-better-auth\.session/.test(cookieHeader);
+
+  // 2) No Authorization header — look for a real JWT in known "session_token"
+  //    cookies only. NOTE: better-auth's "session_data" cookie is a cache
+  //    cookie, not a verifiable asymmetric JWT — it must NOT be run through
+  //    jwtVerify() against the JWKS (that always fails with
+  //    "Unsupported alg" since it's HS256-signed with BETTER_AUTH_SECRET,
+  //    not the JWKS keys). Only session_token-style cookies are real JWTs.
+  if (!token && cookieHeader) {
     const cookies = Object.fromEntries(cookieHeader.split(';').map(c => {
       const [k, ...v] = c.split('=');
       return [k.trim(), decodeURIComponent(v.join('='))];
     }));
 
-    // Try common cookie names first
-    const candidateNames = ['better-auth', 'better-auth.session', 'next-auth.session-token', 'access-token', 'session', '__Secure-better-auth.session_token'];
-    for (const name of candidateNames) {
-      if (cookies[name]) {
-        const val = cookies[name];
-        // If this looks like a JWT (three dot-separated parts) use it
-        if (/^[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+$/.test(val)) {
-          token = val;
-          tokenSource = `cookie:${name}`;
-          break;
-        }
+    const jwtCandidateNames = [
+      'better-auth.session_token',
+      '__Secure-better-auth.session_token',
+    ];
+
+    for (const name of jwtCandidateNames) {
+      const val = cookies[name];
+      if (val && /^[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+$/.test(val)) {
+        token = val;
+        tokenSource = `cookie:${name}`;
+        break;
       }
     }
-
-    // Fallback: scan all cookie values for a JWT-ish value
-    if (!token) {
-      for (const [k,v] of Object.entries(cookies)) {
-        if (/^[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+$/.test(v)) {
-          token = v;
-          tokenSource = `cookie:${k}`;
-          break;
-        }
-      }
-    }
-
-    // If we didn't find a JWT but we do have better-auth cookies, we will treat
-    // the session as opaque and fetch it from the auth server below.
   }
 
-  // If there is no raw token, try get-session when better-auth cookies are present
+  // 3) No real JWT found, but a better-auth session cookie exists (e.g. the
+  //    session_data cache cookie) — resolve via get-session directly,
+  //    skip jwtVerify entirely.
   if (!token) {
-    if (req.headers.cookie && /better-auth|better-auth\.session|__Secure-better-auth/.test(req.headers.cookie)) {
-      try {
-        console.log('verifyToken: no JWT token found, calling auth server get-session');
-        const resp = await fetch(`${AUTH_SERVER_URL}/api/auth/get-session`, {
-          headers: { cookie: req.headers.cookie },
-        });
-        if (resp && resp.ok) {
-          const json = await resp.json();
-          req.decoded = {
-            email: json.user?.email,
-            role: json.user?.role,
-            sub: json.user?.id,
-            session: json.session || null,
-          };
-          console.log(`verifyToken: attached session for email=${req.decoded.email}`);
-          return next();
-        } else {
-          console.warn('verifyToken: get-session returned non-ok', resp && resp.status);
-        }
-      } catch (e) {
-        console.error('get-session call failed:', e?.message || e);
-      }
+    if (hasBetterAuthCookie) {
+      console.log('verifyToken: no JWT cookie found, calling auth server get-session');
+      const ok = await attachSessionFromAuthServer(req, res, cookieHeader);
+      if (ok) return next();
     }
-
     return res.status(401).send({ message: "Unauthorized access" });
-  }
-
-  // If token exists but doesn't look like a JWT, fallback to get-session instead of attempting JWT verify
-  const isJwt = /^[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+$/.test(token);
-  if (!isJwt) {
-    // opaque token (not a JWT)
-    if (req.headers.cookie && /better-auth|better-auth\.session|__Secure-better-auth/.test(req.headers.cookie)) {
-      try {
-        console.log('verifyToken: token appears opaque, calling get-session as fallback');
-        const resp = await fetch(`${AUTH_SERVER_URL}/api/auth/get-session`, { headers: { cookie: req.headers.cookie } });
-        if (resp && resp.ok) {
-          const json = await resp.json();
-          req.decoded = {
-            email: json.user?.email,
-            role: json.user?.role,
-            sub: json.user?.id,
-            session: json.session || null,
-          };
-          console.log(`verifyToken: attached session (opaque token) for email=${req.decoded.email}`);
-          return next();
-        }
-      } catch (e) {
-        console.error('verifyToken fallback get-session failed:', e?.message || e);
-      }
-    }
-    // If fallback didn't work, treat as unauthorized
-    return res.status(403).send({ message: "Forbidden access" });
   }
 
   const attachUser = async (payload) => {
@@ -246,15 +221,15 @@ const verifyToken = async (req, res, next) => {
     };
   };
 
-  // At this point token is a JWT — try verifying
+  // 4) We have what looks like a real JWT — verify against JWKS.
   try {
-    console.log(`verifyToken: attempting jwtVerify (source=${tokenSource || 'cookie'})`);
+    console.log(`verifyToken: attempting jwtVerify (source=${tokenSource})`);
     const { payload } = await jwtVerify(token, getJWKS(), {
       issuer: AUTH_SERVER_URL,
       audience: AUTH_SERVER_URL,
     });
     await attachUser(payload);
-    next();
+    return next();
   } catch (err) {
     try {
       console.log('verifyToken: jwtVerify initial failed, retrying with forced JWKS refresh');
@@ -266,6 +241,11 @@ const verifyToken = async (req, res, next) => {
       return next();
     } catch (retryErr) {
       console.error("JWT verify failed:", retryErr.message);
+      // Last resort: fall back to get-session if we still have a cookie header
+      if (hasBetterAuthCookie) {
+        const ok = await attachSessionFromAuthServer(req, res, cookieHeader);
+        if (ok) return next();
+      }
       return res.status(403).send({ message: "Forbidden access" });
     }
   }
@@ -612,8 +592,6 @@ app.get('/api/bookmarks', verifyToken, async (req, res) => {
     res.status(500).send({ message: "Failed to load bookmarks" });
   }
 });
-
-// ---- GET /api/users/me ----
 
 // ---- INTERNAL: GET /internal/user?email=... (local dev helper) ----
 app.get('/internal/user', async (req, res) => {

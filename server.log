@@ -214,3 +214,9 @@ verifyToken: token appears opaque, calling get-session as fallback
 verifyToken: attached session (opaque token) for email=asikk2925@gmail.com
 verifyToken: token appears opaque, calling get-session as fallback
 verifyToken: attached session (opaque token) for email=asikk2925@gmail.com
+Restarting 'index.js'
+◇ injected env (6) from .env // tip: ◈ secrets for agents [www.dotenvx.com]
+Stripe configured: true
+AUTH_SERVER_URL is set to: http://localhost:3000
+Connected to MongoDB!
+Server running on port 5000
