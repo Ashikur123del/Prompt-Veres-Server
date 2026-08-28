@@ -1100,6 +1100,29 @@ app.delete('/api/admin/prompts/:id', verifyToken, verifyAdmin, async (req, res) 
 app.get('/api/admin/payments', verifyToken, verifyAdmin, async (req, res) => {
   try {
     const payments = await paymentsCollection.find().sort({ date: -1 }).toArray();
+    const premiumUsers = await usersCollection
+      .find({ isPremium: true })
+      .project({ email: 1, updatedAt: 1, createdAt: 1 })
+      .toArray();
+
+    const emailsWithPayment = new Set(payments.map((p) => p.email).filter(Boolean));
+
+    for (const user of premiumUsers) {
+      if (!user.email || emailsWithPayment.has(user.email)) continue;
+      const record = {
+        transactionId: `premium-${user.email}`,
+        email: user.email,
+        amount: 5,
+        date: user.updatedAt || user.createdAt || new Date(),
+        status: "completed",
+        source: "premium-user",
+      };
+      await paymentsCollection.insertOne(record);
+      payments.push(record);
+      emailsWithPayment.add(user.email);
+    }
+
+    payments.sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
     res.send(payments);
   } catch (error) {
     console.error(error);
